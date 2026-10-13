@@ -58,17 +58,13 @@ import {IHookrRulesEvents} from "../interfaces/IHookrRulesEvents.sol";
 ///      - King of the Pool, off by default: a nonzero RulesConfig.potBps turns it on. Epochs of `period` seconds
 ///        from the bind; the leader is the payer of the largest authenticated buy of at least `minBuyQuote` gross
 ///        quote spend; the first swap after an epoch, or anyone through `settleEpoch`, closes it and credits the
-///        leader min(pot, spend * maxPrizeBps / 10,000). Each closed epoch then releases `potReleaseBps` of the pot
-///        it carries to the LP accrual.
-///      - Wash resistance. `maxPrizeBps` is at most half of what the protocol keeps of the pool's LP Rewards and Auto
-///        Burn in basis points of a buy, after the pool's integrator rate (`prizeBound` on the kept share), so every
-///        prize is at most half the protocol fee its own winning buy left with the protocol recipient, which never
-///        returns to the buyer, the pool's liquidity or its integrator: a round trip that buys the crown and exits
-///        on another venue (the pool's own family siblings included), or on the pool itself in a later transaction,
-///        loses at least half that fee, even for a creator who owns all the liquidity. A sell on the pool
-///        voids a lead taken earlier in the same transaction; a buy in a transaction that already sold on the pool,
-///        or whose path crosses liquidity added to the pool in the same transaction above the root's tolerance,
-///        cannot lead; the executor's legs never lead.
+///        leader the whole pot. An epoch that closes with no leader releases `potReleaseBps` of the pot it carries
+///        to the LP accrual; the rest carries to the next epoch.
+///      - The pot is funded only by arb recapture profit, so the prize needs no buy fee and `maxPrizeBps` is always
+///        10,000 (the whole pot); a pool needs neither LP Rewards nor Auto Burn for King of the Pool. A sell on the
+///        pool voids a lead taken earlier in the same transaction; a buy in a transaction that already sold on the
+///        pool, or whose path crosses liquidity added to the pool in the same transaction above the root's
+///        tolerance, cannot lead; the executor's legs never lead.
 contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRecaptureEvents, IHookrRulesEvents {
     using PoolIdLibrary for PoolKey;
 
@@ -89,8 +85,8 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
     uint16 public constant DEFAULT_TRADER_BPS = 2_500;
     /// @notice The LP share the launch wizard and SDK pre-fill with King of the Pool off: the rest.
     uint16 public constant DEFAULT_LP_BPS = 7_500;
-    /// @notice Most share of the remainder a King of the Pool pool may put in its pot (RulesConfig.potBps).
-    uint16 public constant MAX_POT_BPS = 5_000;
+    /// @notice Most share of the remainder a King of the Pool pool may put in its pot (RulesConfig.potBps): all of it.
+    uint16 public constant MAX_POT_BPS = 10_000;
     /// @notice The pot share the wizard pre-fills when the creator turns King of the Pool on. Off by default.
     uint16 public constant DEFAULT_POT_BPS = 2_500;
     /// @notice Shortest King of the Pool epoch.
@@ -105,10 +101,9 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
     uint16 public constant MAX_POT_RELEASE_BPS = 10_000;
     /// @notice The release the wizard pre-fills: half the carried pot per closed epoch.
     uint16 public constant DEFAULT_POT_RELEASE_BPS = 5_000;
-    /// @notice Least prize ceiling of a King of the Pool pool; the most is the pool's `prizeBound`.
-    uint16 public constant MIN_PRIZE_BPS = 1;
-    /// @notice The share of the protocol fee a winning buy paid that its prize may reach: half, so taking the crown
-    ///         always costs at least the other half.
+    /// @notice The one maxPrizeBps a King of the Pool pool may freeze: 10,000, the whole pot to the winner.
+    uint16 public constant MIN_PRIZE_BPS = 10_000;
+    /// @notice Kept for the interface; the bind no longer bounds the prize by a fee share.
     uint16 public constant PRIZE_SHARE_OF_FEE_BPS = 5_000;
     /// @notice The protocol's cut of every arb recapture, in basis points of the profit its push reports (the push at
     ///         the pool's frozen partner share, `reportedProfit`): 25%, the same on every pool and independent of its
@@ -161,8 +156,7 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
         if (keccak256(data[RULES_HEAD:]) != keccak256(abi.encode(rc))) revert InvalidConfig();
         PoolId id = key.toId();
         HookrRules.State storage s = _state();
-        // The Rules froze the pool's integrator before forwarding the bind.
-        _validate(c, rc, s.integrations[id].bps);
+        _validate(c, rc);
         s.recapture[id] = HookrRules.Recapture(
             pc.quote,
             true,
@@ -479,9 +473,7 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
     }
 
     /// @notice The pool's frozen recapture config and pot share. Zeros for a pool without recapture.
-    /// @dev `protocolShareBps` is the pool's whole rule-fee share. The bind checked `maxPrizeBps` against the share Hookr
-    ///      keeps after the pool's integrator: to rebuild that ceiling, read the rate with `integration(id)` and call
-    ///      `prizeBoundFor(lpBps, burnBps, protocolShareBps, rate)`, not `prizeBound` on this share.
+    /// @dev `protocolShareBps` is the pool's whole rule-fee share. A King of the Pool pool's `maxPrizeBps` is 10,000.
     function recaptureConfig(PoolId id)
         external
         view
@@ -513,20 +505,14 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
         (leader, leaderAmount, pot) = (h.leader, h.leaderAmount, h.pot);
     }
 
-    /// @notice The prize the current leader would receive if the epoch closed now, and the pot one closure would
-    ///         carry after its release.
+    /// @notice The prize the current leader would receive if the epoch closed now (the whole pot), and the pot one
+    ///         closure would carry: none with a leader, else the pot after one potReleaseBps release.
     function pendingPrize(PoolId id) external view delegated returns (address leader, uint256 prize, uint256 carried) {
         HookrRules.State storage s = _state();
         HookrRules.Hill storage h = s.hills[id];
-        HookrRules.Recapture storage rc = s.recapture[id];
         leader = h.leader;
-        carried = h.pot;
-        if (leader != address(0)) {
-            prize = uint256(h.leaderAmount) * rc.maxPrizeBps / BPS;
-            if (prize > carried) prize = carried;
-            carried -= prize;
-        }
-        carried = _carried(carried, rc.potReleaseBps, 1);
+        if (leader != address(0)) prize = h.pot;
+        else carried = _carried(h.pot, s.recapture[id].potReleaseBps, 1);
     }
 
     /// @notice The pool's unclaimed liquidity owner accrual in `currency`.
@@ -564,30 +550,16 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
         potBps = 0;
     }
 
-    /// @notice The largest maxPrizeBps a King of the Pool pool may freeze with these native rules: half
-    ///         (PRIZE_SHARE_OF_FEE_BPS) of the protocol's share of LP Rewards plus its share of Auto Burn, in basis
-    ///         points of a buy's gross quote spend, each rounded down to whole basis points, so never more than the
-    ///         Rules take: they round the protocol's share up, in pips. Zero means the rules leave no room for a prize.
-    ///         A pool with an integrator is bound on the share the protocol keeps after the integrator's rate,
-    ///         protocolShareBps x (10,000 - rate) / 10,000 rounded down, which is never more than it keeps: the
-    ///         integrator's part is rounded down. The bind checks the pool's maxPrizeBps against that kept share, so a
-    ///         tool that pre-fills a pool naming an integrator passes the kept share here, or calls `prizeBoundFor`
-    ///         with the rate; this bound on the pool's whole share is refused for it.
-    function prizeBound(uint16 lpBps, uint16 burnBps, uint16 protocolShareBps) public pure returns (uint256) {
-        return (uint256(lpBps) * protocolShareBps / BPS + uint256(burnBps) * protocolShareBps / BPS)
-            * PRIZE_SHARE_OF_FEE_BPS / BPS;
+    /// @notice The maxPrizeBps a King of the Pool pool freezes, whatever its rules: 10,000, the whole pot. The
+    ///         arguments are kept for the interface and do not change the answer.
+    function prizeBound(uint16, uint16, uint16) public pure returns (uint256) {
+        return BPS;
     }
 
-    /// @notice The largest maxPrizeBps the bind admits for a King of the Pool pool with these native rules that names
-    ///         an integrator at `integratorBps` (the treasury's rate for it, 0 to 5,000; 0 for no integrator):
-    ///         `prizeBound` on the share the protocol keeps after it, protocolShareBps x (10,000 - integratorBps) /
-    ///         10,000 rounded down. The same computation the bind runs.
-    function prizeBoundFor(uint16 lpBps, uint16 burnBps, uint16 protocolShareBps, uint16 integratorBps)
-        public
-        pure
-        returns (uint256)
-    {
-        return prizeBound(lpBps, burnBps, _kept(protocolShareBps, integratorBps));
+    /// @notice The maxPrizeBps the bind admits for a King of the Pool pool, whatever its rules and integrator: 10,000,
+    ///         the whole pot. The arguments are kept for the interface and do not change the answer.
+    function prizeBoundFor(uint16, uint16, uint16, uint16) public pure returns (uint256) {
+        return BPS;
     }
 
     /// @notice The least protocolShareBps a pool binding now must have: the larger of the Rules' immutable floor
@@ -602,21 +574,11 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
         }
     }
 
-    /// @dev The share the protocol keeps of `protocolShareBps` after an integrator at `integratorBps` (at most 10,000),
-    ///      rounded down: never more than `protocolShareBps`, so it fits 16 bits.
-    function _kept(uint16 protocolShareBps, uint256 integratorBps) private pure returns (uint16) {
-        return uint16(uint256(protocolShareBps) * (BPS - integratorBps) / BPS);
-    }
-
     /// @dev A recapture pool's config: the split sums to the whole remainder inside its bounds, and King of the Pool
-    ///      (a nonzero potBps) takes every knob inside its bounds with a prize at most half the protocol fee its
-    ///      winning buy leaves with the protocol recipient, after the pool's integrator rate `integratorBps`
-    ///      (PrizeAboveBound beyond it); off, every King of the Pool knob is zero. The Rules check protocolShareBps
+    ///      (a nonzero potBps) takes every knob inside its bounds with maxPrizeBps 10,000 (the whole pot); it needs
+    ///      no LP Rewards or Auto Burn. Off, every King of the Pool knob is zero. The Rules check protocolShareBps
     ///      against the effective floor.
-    function _validate(HookrTypes.RulesConfig memory c, HookrTypes.RecaptureConfig memory rc, uint256 integratorBps)
-        private
-        pure
-    {
+    function _validate(HookrTypes.RulesConfig memory c, HookrTypes.RecaptureConfig memory rc) private pure {
         if (
             !rc.on || rc.traderBps > MAX_TRADER_BPS || c.potBps > MAX_POT_BPS
                 || uint256(rc.traderBps) + rc.lpBps + c.potBps != BPS || rc.releaseBlocks < MIN_RELEASE_BLOCKS
@@ -624,13 +586,10 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
         ) revert InvalidConfig();
         if (c.potBps != 0) {
             if (
-                rc.period < MIN_PERIOD || rc.period > MAX_PERIOD || rc.maxPrizeBps < MIN_PRIZE_BPS
+                rc.period < MIN_PERIOD || rc.period > MAX_PERIOD || rc.maxPrizeBps != MIN_PRIZE_BPS
                     || rc.potReleaseBps < MIN_POT_RELEASE_BPS || rc.potReleaseBps > MAX_POT_RELEASE_BPS
                     || rc.minBuyQuote == 0
             ) revert InvalidConfig();
-            // integratorBps <= 5,000 (HookrRules._feeTerms), so the kept share fits 16 bits.
-            uint256 bound = prizeBound(c.lpBps, c.burnBps, _kept(c.protocolShareBps, integratorBps));
-            if (rc.maxPrizeBps > bound) revert PrizeAboveBound(rc.maxPrizeBps, bound);
         } else if (rc.period != 0 || rc.maxPrizeBps != 0 || rc.potReleaseBps != 0 || rc.minBuyQuote != 0) {
             revert InvalidConfig();
         }
@@ -677,39 +636,43 @@ contract HookrRecapture is IHookrAdvisoryFeeCounter, IHookrRulesKnobs, IHookrRec
         emit LeaderChanged(id, x.payer, spend, epochStart);
     }
 
-    /// @dev Closes every elapsed epoch at once, pays the first closed epoch's leader and releases potReleaseBps of
-    ///      the carried pot per closed epoch to the pool's LP accrual. Liabilities are unchanged.
+    /// @dev Closes every elapsed epoch at once. With a leader, the first closed epoch pays it the whole pot and nothing
+    ///      is released; with none, potReleaseBps of the carried pot per closed epoch goes to the pool's LP accrual.
+    ///      Liabilities are unchanged: the pot is already counted in them, and the prize becomes the leader's claim.
     function _roll(HookrRules.State storage s, PoolId id, HookrRules.Recapture storage rc) private {
         HookrRules.Hill storage h = s.hills[id];
         uint256 start = h.epochStart;
         uint256 period = rc.period;
         if (block.timestamp < start + period) return;
         uint256 closed = (block.timestamp - start) / period;
-        uint256 pot = h.leader == address(0) ? h.pot : _crown(s, id, h, rc, start);
-        uint256 carried = _carried(pot, rc.potReleaseBps, closed);
-        if (carried != pot) {
-            // The released pot is an LP share in the quote, one of the pool's two currencies.
-            _lpShare(s, id, rc.quote, pot - carried, true, s.pools[id].quoteIsCurrency0);
-            emit PotReleased(id, pot - carried);
+        uint256 pot = h.pot;
+        uint256 carried;
+        if (h.leader != address(0)) {
+            // The leader takes the whole pot: nothing is released and nothing carries.
+            _crown(s, id, h, rc, start, pot);
+        } else {
+            carried = _carried(pot, rc.potReleaseBps, closed);
+            if (carried != pot) {
+                // The released pot is an LP share in the quote, one of the pool's two currencies.
+                _lpShare(s, id, rc.quote, pot - carried, true, s.pools[id].quoteIsCurrency0);
+                emit PotReleased(id, pot - carried);
+            }
         }
         h.pot = uint128(carried);
         h.epochStart = uint64(start + closed * period);
         emit EpochRolled(id, uint64(start), h.epochStart, carried);
     }
 
-    /// @dev Credits the closed epoch's leader min(pot, leaderAmount * maxPrizeBps / 10,000) and returns the pot left.
+    /// @dev Credits the closed epoch's leader `prize`, the whole pot, as a claim in the quote, and clears the lead.
     function _crown(
         HookrRules.State storage s,
         PoolId id,
         HookrRules.Hill storage h,
         HookrRules.Recapture storage rc,
-        uint256 start
-    ) private returns (uint256 pot) {
-        pot = h.pot;
+        uint256 start,
+        uint256 prize
+    ) private {
         address leader = h.leader;
-        uint256 prize = uint256(h.leaderAmount) * rc.maxPrizeBps / BPS;
-        if (prize > pot) prize = pot;
-        pot -= prize;
         if (prize != 0) s.claims[rc.quote][leader] += prize;
         h.leader = address(0);
         h.leaderAmount = 0;
